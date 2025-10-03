@@ -394,7 +394,7 @@ class OrbModel(ModelInterface):
             sim_state = sim_state.to(self._device)
 
         half_supercell = (
-            torch.min(sim_state.volume) > 1000
+            sim_state.pbc and torch.min(sim_state.volume) > 1000
             if self._half_supercell is None
             else self._half_supercell
         )
