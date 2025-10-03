@@ -18,6 +18,19 @@ DEVICE = torch.device("cpu")
 DTYPE = torch.float64
 
 
+# TODO: recreate these to minimize changes in #274 to be deleted in #264
+@pytest.fixture
+def device() -> torch.device:
+    """Fixture for torch.device."""
+    return DEVICE
+
+
+@pytest.fixture
+def dtype() -> torch.dtype:
+    """Fixture for torch.dtype."""
+    return DTYPE
+
+
 @pytest.fixture
 def lj_model() -> LennardJonesModel:
     """Create a Lennard-Jones model with reasonable parameters for Ar."""
