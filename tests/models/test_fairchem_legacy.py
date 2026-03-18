@@ -7,10 +7,10 @@ import torch
 import torch_sim as ts
 from tests.conftest import DEVICE
 from tests.models.conftest import (
-    consistency_test_simstate_fixtures,
     make_model_calculator_consistency_test,
     make_validate_model_outputs_test,
 )
+from torch_sim.testing import SIMSTATE_BULK_GENERATORS, SIMSTATE_MOLECULE_GENERATORS
 
 
 try:
@@ -20,9 +20,10 @@ try:
 
     from torch_sim.models.fairchem_legacy import FairChemV1Model
 
-except ImportError:
+except (ImportError, OSError, RuntimeError, AttributeError, ValueError):
     pytest.skip(
-        f"FairChem not installed: {traceback.format_exc()}", allow_module_level=True
+        f"FairChem not installed: {traceback.format_exc()}",  # ty:ignore[too-many-positional-arguments]
+        allow_module_level=True,
     )
 
 
@@ -69,7 +70,7 @@ test_fairchem_ocp_consistency_pbc = make_model_calculator_consistency_test(
     test_name="fairchem_ocp",
     model_fixture_name="eqv2_oc20_model_pbc",
     calculator_fixture_name="ocp_calculator",
-    sim_state_names=consistency_test_simstate_fixtures[:-1],
+    sim_state_names=tuple(SIMSTATE_BULK_GENERATORS.keys()),
     energy_rtol=5e-4,  # NOTE: EqV2 doesn't pass at the 1e-5 level used for other models
     energy_atol=5e-4,
     force_rtol=5e-4,
@@ -78,11 +79,11 @@ test_fairchem_ocp_consistency_pbc = make_model_calculator_consistency_test(
     stress_atol=5e-4,
 )
 
-test_fairchem_non_pbc_benzene = make_model_calculator_consistency_test(
+test_fairchem_non_pbc = make_model_calculator_consistency_test(
     test_name="fairchem_non_pbc_benzene",
     model_fixture_name="eqv2_oc20_model_non_pbc",
     calculator_fixture_name="ocp_calculator",
-    sim_state_names=["benzene_sim_state"],
+    sim_state_names=tuple(SIMSTATE_MOLECULE_GENERATORS.keys()),
     energy_rtol=5e-4,  # NOTE: EqV2 doesn't pass at the 1e-5 level used for other models
     energy_atol=5e-4,
     force_rtol=5e-4,
@@ -112,7 +113,8 @@ def test_fairchem_mixed_pbc_forward_raises(
     eqv2_oc20_model_pbc: FairChemV1Model, si_sim_state: ts.SimState
 ) -> None:
     """Test that calling forward with a SimState that has mixed PBC raises ValueError."""
-    mixed_pbc_state = si_sim_state.clone()
-    mixed_pbc_state.pbc = torch.tensor([True, False, True], dtype=torch.bool)
+    mixed_pbc_state = ts.SimState.from_state(
+        si_sim_state, pbc=torch.tensor([True, False, True], dtype=torch.bool)
+    )
     with pytest.raises(ValueError, match="FairChemV1Model does not support mixed PBC"):
         eqv2_oc20_model_pbc(mixed_pbc_state)

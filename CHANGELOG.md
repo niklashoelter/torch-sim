@@ -1,6 +1,103 @@
 <!-- markdownlint-disable -->
 # Changelog
 
+## Unreleased
+
+## v0.5.2
+
+This release adds batched L-BFGS and BFGS optimizers, a FixSymmetry constraint, performance improvements to `ts.static` and `ts.optimize` through improved batching, and an MD progress bar. It also includes several bug fixes and quality-of-life improvements.
+
+### 🎉 New Features
+* Implement batched L-BFGS and BFGS optimizers by @abhijeetgangan in [#365](https://github.com/TorchSim/torch-sim/pull/365)
+* Add FixSymmetry constraint by @danielzuegner in [#438](https://github.com/TorchSim/torch-sim/pull/438)
+* Enable MD progress bar by @danielzuegner in [#448](https://github.com/TorchSim/torch-sim/pull/448)
+* Implement `SimState.wrap_positions` using `pbc_wrap_batched` by @Praagnya in [#350](https://github.com/TorchSim/torch-sim/pull/350)
+
+### 🚀 Performance
+* Accelerated `ts.static` + added scaling scripts by @falletta in [#427](https://github.com/TorchSim/torch-sim/pull/427)
+* Accelerated `ts.optimize` by batching Frechet Cell Filter by @falletta in [#439](https://github.com/TorchSim/torch-sim/pull/439)
+* Accelerated `TrajectoryReporter` when trajectory output is disabled by @falletta in [#441](https://github.com/TorchSim/torch-sim/pull/441)
+* Vectorize atom index computation in L-BFGS optimizer by @falletta in [#444](https://github.com/TorchSim/torch-sim/pull/444)
+
+### 🛠 Enhancements
+* Add cumulative strain guard to FixSymmetry by @janosh in [#447](https://github.com/TorchSim/torch-sim/pull/447)
+* Move SPS to a helper method and add documentation by @CompRhys in [#455](https://github.com/TorchSim/torch-sim/pull/455)
+* Testing utils for external model posture by @CompRhys in [#433](https://github.com/TorchSim/torch-sim/pull/433)
+
+### 🐛 Bug Fixes
+* Fix constraint `atom_idx` not remapped on reordered slice by @falletta in [#457](https://github.com/TorchSim/torch-sim/pull/457)
+* Fix L-BFGS history consistency for state updates by @falletta in [#443](https://github.com/TorchSim/torch-sim/pull/443)
+* Handle wrapping correctly for default neighborlist by @abhijeetgangan in [#436](https://github.com/TorchSim/torch-sim/pull/436)
+
+### 🧹 House-Keeping
+* Bump pre-commit hooks and fix ruff lint errors by @janosh in [#442](https://github.com/TorchSim/torch-sim/pull/442)
+* Make GraphPES tests less flaky by @CompRhys in [#446](https://github.com/TorchSim/torch-sim/pull/446)
+
+## v0.5.1
+
+This release adds several new features including constraints support for molecular dynamics and optimization, trajectory appending capabilities, and a batch cell list implementation. It also includes improvements to integrator initialization, temperature handling, and numerous bug fixes.
+
+### 🎉 New Features
+* Constraints support for molecular dynamics and optimization by @thomasloux in [#294](https://github.com/TorchSim/torch-sim/pull/294)
+  - Added `FixAtoms` constraint to fix specific atoms in place
+  - Added `FixCom` constraint to prevent center of mass drift
+  - Constraints automatically adjust degrees of freedom for accurate temperature calculations
+  - Full support across all integrators (NVE, NVT, NPT) and optimizers (FIRE, Gradient Descent)
+  - Constraints preserved during state manipulation (slicing, splitting, concatenation)
+* Scale atoms when changing cell by @thomasloux in [#344](https://github.com/TorchSim/torch-sim/pull/344)
+* Allow different temperatures in `ts.integrate` by @thomasloux in [#367](https://github.com/TorchSim/torch-sim/pull/367)
+* Add batch cell list by @abhijeetgangan in [#388](https://github.com/TorchSim/torch-sim/pull/388)
+* Enable appending to trajectory when using `ts.optimize`/`ts.integrate` by @danielzuegner in [#361](https://github.com/TorchSim/torch-sim/pull/361)
+* Enable user to save initial state of trajectory by @danielzuegner in [#415](https://github.com/TorchSim/torch-sim/pull/415)
+
+### 🛠 Enhancements
+* Better default force convergence function by @orionarcher in [#404](https://github.com/TorchSim/torch-sim/pull/404)
+* Add systemwise `max_force` as a default property for reporter_dict by @orionarcher in [#410](https://github.com/TorchSim/torch-sim/pull/410)
+* Add charge and spin to common_args dicts by @orionarcher in [#413](https://github.com/TorchSim/torch-sim/pull/413)
+* Replace manual initialization with `from_state` across integrators and optimizers by @orionarcher in [#420](https://github.com/TorchSim/torch-sim/pull/420)
+* Update energy description to 'Potential energy' by @danielzuegner in [#408](https://github.com/TorchSim/torch-sim/pull/408)
+* Use upstream NequipTorchSimModel by @CompRhys in [#400](https://github.com/TorchSim/torch-sim/pull/400)
+
+### 🐛 Bug Fixes
+* Fix cuequivariance MACE by @thomasloux in [#391](https://github.com/TorchSim/torch-sim/pull/391)
+* Fix SevenNet tests by @YutackPark in [#393](https://github.com/TorchSim/torch-sim/pull/393)
+* Fix tutorials dependencies by @thomasloux in [#396](https://github.com/TorchSim/torch-sim/pull/396)
+* Fix offsets in merge_constraints by @falletta in [#402](https://github.com/TorchSim/torch-sim/pull/402)
+* Fix memory scaling calculation for non-periodic boundary conditions by @orionarcher in [#412](https://github.com/TorchSim/torch-sim/pull/412)
+* Download NequIP model from Zenodo instead of nequip.net by @orionarcher in [#418](https://github.com/TorchSim/torch-sim/pull/418)
+
+### 📖 Documentation
+* Update metatrain version in metatomic tutorial by @Luthaf in [#395](https://github.com/TorchSim/torch-sim/pull/395)
+
+### 🧹 House-Keeping
+* Add close stale bot by @CompRhys in [#411](https://github.com/TorchSim/torch-sim/pull/411)
+* Significantly consolidate scripts to speed up testing by @orionarcher in [#385](https://github.com/TorchSim/torch-sim/pull/385)
+* Use validate_model_outputs in testing by @CompRhys in [#401](https://github.com/TorchSim/torch-sim/pull/401)
+* Reduce test wall time by @CompRhys in [#403](https://github.com/TorchSim/torch-sim/pull/403)
+* Pin scipy for fairchem tests by @CompRhys in [#405](https://github.com/TorchSim/torch-sim/pull/405)
+* Disable NequIP tests for Python 3.13 by @curtischong in [#421](https://github.com/TorchSim/torch-sim/pull/421)
+
+## v0.5.0
+
+This release focuses on improving batch processing capabilities across TorchSim. The neighbor list module has been completely refactored to support batched calculations with multiple backend implementations, elastic tensor calculations now leverage batched operations for improved performance, and a bug fix ensures Monte Carlo swaps work correctly with ragged (different-sized) systems.
+
+### 🎉 New Features
+* Refactor neighbor list module with batched support and multiple backends by @abhijeetgangan in [#348](https://github.com/TorchSim/torch-sim/pull/348)
+  - New unified `torchsim_nl` function with automatic backend selection
+  - Multiple implementations: Alchemiops (NVIDIA CUDA), Vesin, torch_nl, and pure PyTorch fallback
+  - Support for both single-system and batched (multi-system) calculations
+  - Automatic selection of best available implementation based on installed packages
+
+### 🛠 Enhancements
+* Batch elastic operations by @orionarcher in [#384](https://github.com/TorchSim/torch-sim/pull/384)
+  - `calculate_elastic_tensor` now uses `ts.static` runner for batched calculations
+  - Added `autobatcher` parameter for memory-efficient processing of deformations
+  - Added `pbar` parameter for progress bar support
+
+### 🐛 Bug Fixes
+* Fix Monte Carlo swap for ragged systems by @curtischong in [#380](https://github.com/TorchSim/torch-sim/pull/380)
+  - Fixed `generate_swaps` calculation of system start indices for systems with different atom counts
+
 ## v0.4.2
 
 Thank you to everyone who contributed to this release! This release includes important bug fixes and new features. @thomasloux, @orionarcher, @WillEngler, @RishikeshMagar, @nh-univie, @andrewrm98, @danielzuegner, and others made valuable contributions. 🚀

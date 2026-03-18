@@ -16,12 +16,21 @@ Examples:
     ...     mc_state = ts.swap_mc_step(model, mc_state, kT=0.1 * units.energy)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from torch_sim.models.interface import ModelInterface
 from torch_sim.state import SimState
+
+
+# Sentinel value for uninitialized last_permutation
+_UNINITIALIZED_PERMUTATION = torch.empty(0, dtype=torch.long)
+
+
+def _create_uninitialized_permutation() -> torch.Tensor:
+    """Create a sentinel tensor for uninitialized last_permutation."""
+    return _UNINITIALIZED_PERMUTATION.clone()
 
 
 @dataclass(kw_only=True)
@@ -35,14 +44,27 @@ class SwapMCState(SimState):
     Attributes:
         energy (torch.Tensor): Energy of the system with shape [batch_size]
         last_permutation (torch.Tensor): Last permutation applied to the system,
-            with shape [n_atoms], tracking the moves made for analysis or reversal
+            with shape [n_atoms], tracking the moves made for analysis or reversal.
+            If not provided, will be initialized to identity permutation
+            (torch.arange(n_atoms)) in __post_init__.
     """
 
     energy: torch.Tensor
-    last_permutation: torch.Tensor
+    last_permutation: torch.Tensor = field(
+        default_factory=_create_uninitialized_permutation
+    )
 
     _atom_attributes = SimState._atom_attributes | {"last_permutation"}  # noqa: SLF001
     _system_attributes = SimState._system_attributes | {"energy"}  # noqa: SLF001
+
+    def __post_init__(self) -> None:
+        """Initialize SwapMCState and set default last_permutation if needed."""
+        super().__post_init__()
+        # Check if last_permutation is the sentinel (empty tensor)
+        if self.last_permutation.numel() == 0:
+            self.last_permutation = torch.arange(
+                self.n_atoms, device=self.device, dtype=torch.long
+            )
 
 
 def generate_swaps(state: SimState, rng: torch.Generator | None = None) -> torch.Tensor:
@@ -61,27 +83,23 @@ def generate_swaps(state: SimState, rng: torch.Generator | None = None) -> torch
         torch.Tensor: A tensor of proposed swaps with shape [n_systems, 2],
             where each row contains indices of atoms to be swapped
     """
-    system = state.system_idx
     atomic_numbers = state.atomic_numbers
 
-    system_lengths = system.bincount()
-
-    # change system_lengths to system
-    system = torch.repeat_interleave(
-        torch.arange(len(system_lengths), device=system.device), system_lengths
-    )
+    system_lengths = state.system_idx.bincount()
 
     # Create ragged weights tensor without loops
     max_length = torch.max(system_lengths).item()
     n_systems = len(system_lengths)
 
     # Create a range tensor for each system
-    range_tensor = torch.arange(max_length, device=system.device).expand(
-        n_systems, max_length
+    range_tensor = torch.arange(int(max_length), device=state.device).expand(
+        n_systems, int(max_length)
     )
 
     # Create a mask where values are less than the max system length
-    system_lengths_expanded = system_lengths.unsqueeze(1).expand(n_systems, max_length)
+    system_lengths_expanded = system_lengths.unsqueeze(1).expand(
+        n_systems, int(max_length)
+    )
     weights = (range_tensor < system_lengths_expanded).float()
 
     first_index = torch.multinomial(weights, 1, replacement=False, generator=rng)
@@ -91,7 +109,7 @@ def generate_swaps(state: SimState, rng: torch.Generator | None = None) -> torch
 
     for sys_idx in range(n_systems):
         # Get global index of selected atom
-        first_idx = first_index[sys_idx, 0].item() + system_starts[sys_idx].item()
+        first_idx = int(first_index[sys_idx, 0].item() + system_starts[sys_idx].item())
         first_type = atomic_numbers[first_idx]
 
         # Get indices of atoms in this system
@@ -213,7 +231,7 @@ def swap_mc_init(
         atomic_numbers=state.atomic_numbers,
         system_idx=state.system_idx,
         energy=model_output["energy"],
-        last_permutation=torch.arange(state.n_atoms, device=state.device),
+        _constraints=state.constraints,
     )
 
 

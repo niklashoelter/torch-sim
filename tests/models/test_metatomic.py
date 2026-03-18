@@ -5,10 +5,10 @@ import torch
 
 from tests.conftest import DEVICE
 from tests.models.conftest import (
-    consistency_test_simstate_fixtures,
     make_model_calculator_consistency_test,
     make_validate_model_outputs_test,
 )
+from torch_sim.testing import SIMSTATE_GENERATORS
 
 
 try:
@@ -18,7 +18,8 @@ try:
     from torch_sim.models.metatomic import MetatomicModel
 except ImportError:
     pytest.skip(
-        f"metatomic not installed: {traceback.format_exc()}", allow_module_level=True
+        f"metatomic not installed: {traceback.format_exc()}",  # ty:ignore[too-many-positional-arguments]
+        allow_module_level=True,
     )
 
 
@@ -51,7 +52,7 @@ test_metatomic_consistency = make_model_calculator_consistency_test(
     test_name="metatomic",
     model_fixture_name="metatomic_model",
     calculator_fixture_name="metatomic_calculator",
-    sim_state_names=consistency_test_simstate_fixtures,
+    sim_state_names=tuple(SIMSTATE_GENERATORS.keys()),
     energy_atol=5e-5,
     dtype=torch.float32,
     device=DEVICE,

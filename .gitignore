@@ -28,12 +28,27 @@ docs/reference/torch_sim.*
 *.hdf5
 *.traj
 
+# ignore torch.save outputs
+*.pt
+
 # coverage
 coverage.xml
 .coverage*
+
+# test cache (compiled models, etc.)
+tests/.cache/
 
 # env
 uv.lock
 
 # IDE
 .vscode/
+
+# duecredit
+.duecredit.p
+
+# agents
+.agents/
+
+# treemap html file
+docs/_static/torch-sim-pkg-treemap.html

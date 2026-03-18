@@ -51,6 +51,7 @@ def test_generate_swaps(batched_diverse_state: ts.SimState, *, use_generator: bo
 
     # System consistency
     system_idx = batched_diverse_state.system_idx
+    assert system_idx is not None
     assert torch.all(system_idx[swaps[:, 0]] == system_idx[swaps[:, 1]])
 
     # Different atomic numbers
@@ -90,6 +91,7 @@ def test_swaps_to_permutation(batched_diverse_state: ts.SimState, *, n_swaps: in
 
     # Test permutation preserves system assignments
     original_system = batched_diverse_state.system_idx
+    assert original_system is not None
     assert torch.all(original_system == original_system[permutation])
 
 
@@ -178,6 +180,8 @@ def test_monte_carlo_integration(
         assert isinstance(mc_state, SwapMCState)
 
     # Verify conservation properties
+    assert mc_state.system_idx is not None
+    assert batched_diverse_state.system_idx is not None
     assert torch.all(mc_state.system_idx == batched_diverse_state.system_idx)
     for sys_idx in torch.unique(mc_state.system_idx):
         orig_mask = batched_diverse_state.system_idx == sys_idx
@@ -185,6 +189,26 @@ def test_monte_carlo_integration(
         orig_counts = torch.bincount(batched_diverse_state.atomic_numbers[orig_mask])
         result_counts = torch.bincount(mc_state.atomic_numbers[result_mask])
         assert torch.all(orig_counts == result_counts)
+
+
+def test_swap_mc_state_default_last_permutation(
+    batched_diverse_state: ts.SimState,
+) -> None:
+    """Test that SwapMCState initializes last_permutation to identity if not provided."""
+    from torch_sim.monte_carlo import SwapMCState
+
+    state = SwapMCState(
+        positions=batched_diverse_state.positions,
+        masses=batched_diverse_state.masses,
+        cell=batched_diverse_state.cell,
+        pbc=batched_diverse_state.pbc,
+        atomic_numbers=batched_diverse_state.atomic_numbers,
+        system_idx=batched_diverse_state.system_idx,
+        energy=torch.zeros(batched_diverse_state.n_systems),
+    )
+    assert state.last_permutation is not None
+    expected_identity = torch.arange(batched_diverse_state.n_atoms, device=DEVICE)
+    assert torch.equal(state.last_permutation, expected_identity)
 
 
 def test_swap_mc_state_attributes():

@@ -126,188 +126,18 @@ def molecule_atoms_set() -> list:
 
 
 @pytest.mark.parametrize("cutoff", [1, 3, 5, 7])
-@pytest.mark.parametrize("use_jit", [True, False])
-@pytest.mark.parametrize("atoms_list", ["periodic_atoms_set", "molecule_atoms_set"])
-def test_primitive_neighbor_list(
-    *, cutoff: float, atoms_list: str, use_jit: bool, request: pytest.FixtureRequest
-) -> None:
-    """Check that primitive_neighbor_list gives the same NL as ASE by comparing
-    the resulting sorted list of distances between neighbors.
-
-    Args:
-        cutoff: Cutoff distance for neighbor search
-        atoms_list: List of atoms to test
-        use_jit: Whether to use the jitted version or disable JIT
-    """
-    atoms_list = request.getfixturevalue(atoms_list)
-
-    # Create a non-jitted version of the function if requested
-    if use_jit:
-        neighbor_list_fn = neighbors.primitive_neighbor_list
-    else:
-        # Create wrapper that disables JIT
-        import os
-
-        old_jit_setting = os.environ.get("PYTORCH_JIT")
-        os.environ["PYTORCH_JIT"] = "0"
-
-        # Import the function again to get the non-jitted version
-        from importlib import reload
-
-        import torch_sim as ts
-
-        reload(ts.neighbors)
-        neighbor_list_fn = ts.neighbors.primitive_neighbor_list
-
-        # Restore JIT setting after test
-        if old_jit_setting is not None:
-            os.environ["PYTORCH_JIT"] = old_jit_setting
-        else:
-            os.environ.pop("PYTORCH_JIT", None)
-
-    for atoms in atoms_list:
-        # Convert to torch tensors
-        pos = torch.tensor(atoms.positions, device=DEVICE, dtype=DTYPE)
-        row_vector_cell = torch.tensor(atoms.cell.array, device=DEVICE, dtype=DTYPE)
-
-        pbc = torch.tensor(atoms.pbc, device=DEVICE, dtype=DTYPE)
-
-        # Get the neighbor list using the appropriate function (jitted or non-jitted)
-        # Note: No self-interaction
-        idx_i, idx_j, shifts_tensor = neighbor_list_fn(
-            quantities="ijS",
-            positions=pos,
-            cell=row_vector_cell,
-            pbc=pbc,
-            cutoff=torch.tensor(cutoff, dtype=DTYPE, device=DEVICE),
-            device=DEVICE,
-            dtype=DTYPE,
-            self_interaction=False,
-            use_scaled_positions=False,
-            max_n_bins=int(1e6),
-        )
-
-        # Create mapping
-        mapping = torch.stack((idx_i, idx_j), dim=0)
-
-        # Convert shifts_tensor to the same dtype as cell before matrix multiplication
-        shifts_tensor = shifts_tensor.to(dtype=DTYPE)
-
-        # Calculate distances with cell shifts
-        cell_shifts_prim = torch.mm(shifts_tensor, row_vector_cell)
-        dds_prim = transforms.compute_distances_with_cell_shifts(
-            pos, mapping, cell_shifts_prim
-        )
-        dds_prim = np.sort(dds_prim.numpy())
-
-        # Get the neighbor list from ase
-        idx_i_ref, idx_j_ref, shifts_ref, dist_ref = neighbor_list(
-            quantities="ijSd",
-            a=atoms,
-            cutoff=cutoff,
-            self_interaction=False,
-            max_nbins=1e6,
-        )
-
-        # Convert to torch tensors
-        idx_i_ref = torch.tensor(idx_i_ref, dtype=torch.long, device=DEVICE)
-        idx_j_ref = torch.tensor(idx_j_ref, dtype=torch.long, device=DEVICE)
-
-        # Create mapping and shifts
-        mapping_ref = torch.stack((idx_i_ref, idx_j_ref), dim=0)
-        shifts_ref = torch.tensor(shifts_ref, dtype=DTYPE, device=DEVICE)
-
-        # Calculate distances with cell shifts
-        cell_shifts_ref = torch.mm(shifts_ref, row_vector_cell)
-        dds_ref = transforms.compute_distances_with_cell_shifts(
-            pos, mapping_ref, cell_shifts_ref
-        )
-
-        # Sort the distances
-        dds_ref = np.sort(dds_ref.numpy())
-        dist_ref = np.sort(dist_ref)
-
-        # Check that the distances are the same with ase and TorchSim logic
-        np.testing.assert_allclose(dds_ref, dist_ref)
-
-        # Check that the primitive_neighbor_list distances match ASE's
-        np.testing.assert_allclose(
-            dds_prim, dist_ref, err_msg=f"Failed with use_jit={use_jit}"
-        )
-
-
-@pytest.mark.parametrize("cutoff", [1, 3, 5, 7])
-@pytest.mark.parametrize("atoms_list", ["periodic_atoms_set", "molecule_atoms_set"])
-@pytest.mark.parametrize(
-    "nl_implementation",
-    [neighbors.standard_nl]
-    + ([neighbors.vesin_nl, neighbors.vesin_nl_ts] if neighbors.VESIN_AVAILABLE else []),
-)
-def test_neighbor_list_implementations(
-    *,
-    cutoff: float,
-    atoms_list: str,
-    nl_implementation: Callable[..., tuple[torch.Tensor, torch.Tensor]],
-    request: pytest.FixtureRequest,
-) -> None:
-    """Check that different neighbor list implementations give the same results as ASE
-    by comparing the resulting sorted list of distances between neighbors.
-    """
-    atoms_list = request.getfixturevalue(atoms_list)
-
-    for atoms in atoms_list:
-        # Convert to torch tensors
-        pos = torch.tensor(atoms.positions, device=DEVICE, dtype=DTYPE)
-        row_vector_cell = torch.tensor(atoms.cell.array, device=DEVICE, dtype=DTYPE)
-        pbc = torch.tensor(atoms.pbc, device=DEVICE, dtype=DTYPE)
-
-        # Get the neighbor list from the implementation being tested
-        mapping, shifts = nl_implementation(
-            positions=pos,
-            cell=row_vector_cell,
-            pbc=pbc,
-            cutoff=torch.tensor(cutoff, dtype=DTYPE, device=DEVICE),
-        )
-
-        # Calculate distances with cell shifts
-        cell_shifts = torch.mm(shifts, row_vector_cell)
-        dds = transforms.compute_distances_with_cell_shifts(pos, mapping, cell_shifts)
-        dds = np.sort(dds.numpy())
-
-        # Get the reference neighbor list from ASE
-        idx_i, idx_j, shifts_ref, dist = neighbor_list(
-            quantities="ijSd",
-            a=atoms,
-            cutoff=cutoff,
-            self_interaction=False,
-            max_nbins=1e6,
-        )
-
-        # Convert to torch tensors and calculate reference distances
-        idx_i = torch.tensor(idx_i, dtype=torch.long, device=DEVICE)
-        idx_j = torch.tensor(idx_j, dtype=torch.long, device=DEVICE)
-        mapping_ref = torch.stack((idx_i, idx_j), dim=0)
-        shifts_ref = torch.tensor(shifts_ref, dtype=torch.float64, device=DEVICE)
-        cell_shifts_ref = torch.mm(shifts_ref, row_vector_cell)
-        dds_ref = transforms.compute_distances_with_cell_shifts(
-            pos, mapping_ref, cell_shifts_ref
-        )
-        dds_ref = np.sort(dds_ref.numpy())
-        dist_ref = np.sort(dist)
-
-        # Verify results
-        np.testing.assert_allclose(dds_ref, dist_ref)
-        np.testing.assert_allclose(dds, dds_ref)
-        np.testing.assert_allclose(dds, dist_ref)
-
-
-@pytest.mark.parametrize("cutoff", [1, 3, 5, 7])
 @pytest.mark.parametrize("self_interaction", [True, False])
 @pytest.mark.parametrize(
     "nl_implementation",
-    [neighbors.torch_nl_n2, neighbors.torch_nl_linked_cell],
+    [neighbors.torch_nl_n2, neighbors.torch_nl_linked_cell]
+    + ([neighbors.vesin_nl, neighbors.vesin_nl_ts] if neighbors.VESIN_AVAILABLE else [])
+    + (
+        [neighbors.alchemiops_nl_n2, neighbors.alchemiops_nl_cell_list]
+        if neighbors.ALCHEMIOPS_AVAILABLE
+        else []
+    ),
 )
-def test_torch_nl_implementations(
+def test_neighbor_list_implementations(
     *,
     cutoff: float,
     self_interaction: bool,
@@ -315,17 +145,19 @@ def test_torch_nl_implementations(
     molecule_atoms_set: list[Atoms],
     periodic_atoms_set: list[Atoms],
 ) -> None:
-    """Check that torch neighbor list implementations give the same results as ASE."""
+    """Check that neighbor list implementations give the same results as ASE.
+
+    Tests all implementations in batched mode with mixed periodic and non-periodic
+    systems, comparing sorted distances against ASE reference values.
+    """
     atoms_list = molecule_atoms_set + periodic_atoms_set
 
-    # Convert to torch batch (concatenate all tensors)
     # NOTE we can't use atoms_to_state here because we want to test mixed
     # periodic and non-periodic systems
     pos, row_vector_cell, pbc, batch, _ = ase_to_torch_batch(
         atoms_list, device=DEVICE, dtype=DTYPE
     )
 
-    # Get the neighbor list from the implementation being tested
     mapping, mapping_system, shifts_idx = nl_implementation(
         cutoff=torch.tensor(cutoff, dtype=DTYPE, device=DEVICE),
         positions=pos,
@@ -335,151 +167,155 @@ def test_torch_nl_implementations(
         self_interaction=self_interaction,
     )
 
-    # Calculate distances
     cell_shifts = transforms.compute_cell_shifts(
         row_vector_cell, shifts_idx, mapping_system
     )
-    dds = transforms.compute_distances_with_cell_shifts(pos, mapping, cell_shifts)
-    dds = np.sort(dds.numpy())
+    dds = np.sort(
+        transforms.compute_distances_with_cell_shifts(pos, mapping, cell_shifts).numpy()
+    )
 
-    # Get reference results from ASE
-    dd_ref = []
-    for atoms in atoms_list:
-        _, _, _, dist = neighbor_list(
+    # Build batched ASE reference with global atom indices
+    ref_i, ref_j, ref_shifts, ref_sys = [], [], [], []
+    offset = 0
+    for sys_idx, atoms in enumerate(atoms_list):
+        idx_i, idx_j, shifts_ref, _ = neighbor_list(
             quantities="ijSd",
             a=atoms,
             cutoff=cutoff,
             self_interaction=self_interaction,
             max_nbins=1e6,
         )
-        dd_ref.extend(dist)
-    dd_ref = np.sort(dd_ref)
+        ref_i.append(torch.tensor(idx_i, dtype=torch.long) + offset)
+        ref_j.append(torch.tensor(idx_j, dtype=torch.long) + offset)
+        ref_shifts.append(torch.tensor(shifts_ref, dtype=DTYPE))
+        ref_sys.append(torch.full((len(idx_i),), sys_idx, dtype=torch.long))
+        offset += len(atoms)
 
-    # Verify results
-    np.testing.assert_allclose(dd_ref, dds)
+    mapping_ref = torch.stack([torch.cat(ref_i), torch.cat(ref_j)], dim=0).to(DEVICE)
+    shifts_ref_t = torch.cat(ref_shifts).to(DEVICE)
+    mapping_system_ref = torch.cat(ref_sys).to(DEVICE)
+
+    cell_shifts_ref = transforms.compute_cell_shifts(
+        row_vector_cell, shifts_ref_t, mapping_system_ref
+    )
+    dds_ref = np.sort(
+        transforms.compute_distances_with_cell_shifts(
+            pos, mapping_ref, cell_shifts_ref
+        ).numpy()
+    )
+
+    # Compare distances and mapping counts
+    np.testing.assert_allclose(dds_ref, dds)
+    assert mapping.shape[1] == mapping_ref.shape[1], (
+        f"Pair count mismatch: got {mapping.shape[1]}, expected {mapping_ref.shape[1]}"
+    )
+    # Ensure pair/system mapping stays consistent in batched mode.
+    assert torch.equal(batch[mapping[0]], batch[mapping[1]])
+    assert torch.equal(batch[mapping[0]], mapping_system)
 
 
-def test_primitive_neighbor_list_edge_cases() -> None:
-    """Test edge cases for primitive_neighbor_list."""
-    # Test different PBC combinations
+@pytest.mark.parametrize("self_interaction", [True, False])
+@pytest.mark.parametrize("pbc_val", [True, False])
+@pytest.mark.parametrize(
+    "nl_implementation",
+    [neighbors.torch_nl_n2, neighbors.torch_nl_linked_cell]
+    + ([neighbors.vesin_nl, neighbors.vesin_nl_ts] if neighbors.VESIN_AVAILABLE else [])
+    + (
+        [neighbors.alchemiops_nl_n2, neighbors.alchemiops_nl_cell_list]
+        if neighbors.ALCHEMIOPS_AVAILABLE and torch.cuda.is_available()
+        else []
+    ),
+)
+def test_nl_pbc_edge_cases(
+    *, pbc_val: bool, self_interaction: bool, nl_implementation: Callable[..., Any]
+) -> None:
+    """Test all NL implementations find neighbors for periodic and non-periodic
+    systems with and without self-interaction.
+    """
     pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]], device=DEVICE, dtype=DTYPE)
     cell = torch.eye(3, device=DEVICE, dtype=DTYPE) * 2.0
     cutoff = torch.tensor(1.5, device=DEVICE, dtype=DTYPE)
+    pbc = torch.tensor([pbc_val, pbc_val, pbc_val], device=DEVICE)
+    system_idx = torch.zeros(2, dtype=torch.long, device=DEVICE)
 
-    # Test all PBC combinations
-    for pbc in [(True, False, False), (False, True, False), (False, False, True)]:
-        idx_i, idx_j, _shifts = neighbors.primitive_neighbor_list(
-            quantities="ijS",
-            positions=pos,
-            cell=cell,
-            pbc=torch.tensor(pbc, device=DEVICE, dtype=DTYPE),
-            cutoff=cutoff,
-            device=DEVICE,
-            dtype=DTYPE,
-        )
-        assert len(idx_i) > 0  # Should find at least one neighbor
-
-    # Test self-interaction
-    idx_i, idx_j, _shifts = neighbors.primitive_neighbor_list(
-        quantities="ijS",
+    mapping, sys_map, _shifts = nl_implementation(
         positions=pos,
         cell=cell,
-        pbc=torch.Tensor([True, True, True]),
+        pbc=pbc,
         cutoff=cutoff,
-        device=DEVICE,
-        dtype=DTYPE,
-        self_interaction=True,
+        system_idx=system_idx,
+        self_interaction=self_interaction,
     )
-    # Should find self-interactions
-    assert torch.any(idx_i == idx_j)
-
-
-def test_standard_nl_edge_cases() -> None:
-    """Test edge cases for standard_nl."""
-    pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]], device=DEVICE, dtype=DTYPE)
-    cell = torch.eye(3, device=DEVICE, dtype=DTYPE) * 2.0
-    cutoff = torch.tensor(1.5, device=DEVICE, dtype=DTYPE)
-
-    # Test different PBC combinations
-    for pbc in (True, False):
-        mapping, _shifts = neighbors.standard_nl(
-            positions=pos,
-            cell=cell,
-            pbc=torch.tensor([pbc] * 3, device=DEVICE, dtype=DTYPE),
-            cutoff=cutoff,
-        )
-        assert len(mapping[0]) > 0  # Should find neighbors
-
-    # Test sort_id
-    mapping, _shifts = neighbors.standard_nl(
-        positions=pos,
-        cell=cell,
-        pbc=torch.Tensor([True, True, True]),
-        cutoff=cutoff,
-        sort_id=True,
-    )
-    # Check if indices are sorted
-    assert torch.all(mapping[0][1:] >= mapping[0][:-1])
+    assert mapping.shape[1] > 0
+    assert (sys_map == 0).all()
 
 
 @pytest.mark.skipif(not neighbors.VESIN_AVAILABLE, reason="Vesin not available")
-def test_vesin_nl_edge_cases() -> None:
-    """Test edge cases for vesin_nl and vesin_nl_ts."""
-    pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]], device=DEVICE, dtype=DTYPE)
-    cell = torch.eye(3, device=DEVICE, dtype=DTYPE) * 2.0
-    cutoff = torch.tensor(1.5, device=DEVICE, dtype=DTYPE)
+def test_vesin_nl_float32() -> None:
+    """Test that vesin_nl (not vesin_nl_ts) accepts float32 inputs."""
+    pos = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]], device=DEVICE, dtype=torch.float32
+    )
+    cell = torch.eye(3, device=DEVICE, dtype=torch.float32) * 2.0
+    cutoff = torch.tensor(1.5, device=DEVICE, dtype=torch.float32)
+    pbc = torch.tensor([True, True, True], device=DEVICE)
+    system_idx = torch.zeros(2, dtype=torch.long, device=DEVICE)
 
-    # Test both implementations
-    for nl_fn in (neighbors.vesin_nl, neighbors.vesin_nl_ts):
-        # Test different PBC combinations
-        for pbc in (
-            torch.Tensor([True, True, True]),
-            torch.Tensor([False, False, False]),
-        ):
-            mapping, _shifts = nl_fn(positions=pos, cell=cell, pbc=pbc, cutoff=cutoff)
-            assert len(mapping[0]) > 0  # Should find neighbors
-
-        # Test sort_id
-        mapping, _shifts = nl_fn(
-            positions=pos,
-            cell=cell,
-            pbc=torch.Tensor([True, True, True]),
-            cutoff=cutoff,
-            sort_id=True,
-        )
-        # Check if indices are sorted
-        assert torch.all(mapping[0][1:] >= mapping[0][:-1])
-
-        # Test different precisions
-        if nl_fn == neighbors.vesin_nl:  # vesin_nl_ts doesn't support float32
-            pos_f32 = pos.to(dtype=torch.float32)
-            cell_f32 = cell.to(dtype=torch.float32)
-            mapping, _shifts = nl_fn(
-                positions=pos_f32,
-                cell=cell_f32,
-                pbc=torch.Tensor([True, True, True]),
-                cutoff=cutoff,
-            )
-            assert len(mapping[0]) > 0  # Should find neighbors
+    mapping, _sys_map, _shifts = neighbors.vesin_nl(
+        positions=pos, cell=cell, pbc=pbc, cutoff=cutoff, system_idx=system_idx
+    )
+    assert mapping.shape[1] > 0
 
 
-def test_torchsim_nl_availability() -> None:
-    """Test that VESIN_AVAILABLE flag is correctly set."""
+def _minimal_neighbor_list_inputs(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create minimal valid tensor inputs for neighbor-list API smoke checks."""
+    positions = torch.zeros((1, 3), dtype=torch.float32, device=device)
+    cell = torch.eye(3, dtype=torch.float32, device=device)
+    pbc = torch.tensor([False, False, False], dtype=torch.bool, device=device)
+    cutoff = torch.tensor(1.0, dtype=torch.float32, device=device)
+    system_idx = torch.zeros(1, dtype=torch.long, device=device)
+    return positions, cell, pbc, cutoff, system_idx
+
+
+def test_vesin_nl_availability() -> None:
+    """Test that availability flags are correctly set."""
     assert isinstance(neighbors.VESIN_AVAILABLE, bool)
-    if neighbors.VESIN_AVAILABLE:
-        assert neighbors.VesinNeighborList is not None
-        assert neighbors.VesinNeighborListTorch is not None
-    else:
-        assert neighbors.VesinNeighborList is None
-        assert neighbors.VesinNeighborListTorch is None
+
+    assert callable(neighbors.vesin_nl)
+    assert callable(neighbors.vesin_nl_ts)
+
+    if not neighbors.VESIN_AVAILABLE:
+        positions, cell, pbc, cutoff, system_idx = _minimal_neighbor_list_inputs(DEVICE)
+        with pytest.raises(ImportError, match="Vesin is not installed"):
+            neighbors.vesin_nl(positions, cell, pbc, cutoff, system_idx)
+        with pytest.raises(ImportError, match="Vesin is not installed"):
+            neighbors.vesin_nl_ts(positions, cell, pbc, cutoff, system_idx)
 
 
-def test_torchsim_nl_consistency() -> None:
-    """Test that torchsim_nl produces consistent results."""
+def test_alchemiops_nl_availability() -> None:
+    """Test that alchemiops optional dependency flags and errors are consistent."""
+    assert isinstance(neighbors.ALCHEMIOPS_AVAILABLE, bool)
+
+    assert callable(neighbors.alchemiops_nl_n2)
+    assert callable(neighbors.alchemiops_nl_cell_list)
+
+    if not neighbors.ALCHEMIOPS_AVAILABLE:
+        positions, cell, pbc, cutoff, system_idx = _minimal_neighbor_list_inputs(DEVICE)
+        with pytest.raises(ImportError, match="nvalchemiops is not installed"):
+            neighbors.alchemiops_nl_n2(positions, cell, pbc, cutoff, system_idx)
+        with pytest.raises(ImportError, match="nvalchemiops is not installed"):
+            neighbors.alchemiops_nl_cell_list(positions, cell, pbc, cutoff, system_idx)
+
+
+def test_fallback_when_alchemiops_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that torch-sim works correctly without alchemiops (CI compatibility)."""
+    # This test ensures CI works even if alchemiops fails to import
+    # torchsim_nl should fall back to pure PyTorch implementations
     device = torch.device("cpu")
     dtype = torch.float32
 
-    # Simple 4-atom test system
     positions = torch.tensor(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
         device=device,
@@ -488,28 +324,35 @@ def test_torchsim_nl_consistency() -> None:
     cell = torch.eye(3, device=device, dtype=dtype) * 3.0
     pbc = torch.tensor([False, False, False], device=device)
     cutoff = torch.tensor(1.5, device=device, dtype=dtype)
+    system_idx = torch.zeros(4, dtype=torch.long, device=device)
 
-    # Test torchsim_nl against standard_nl
-    mapping_torchsim, shifts_torchsim = neighbors.torchsim_nl(
-        positions, cell, pbc, cutoff
+    # Use monkeypatch to temporarily disable alchemiops
+    monkeypatch.setattr(neighbors, "ALCHEMIOPS_AVAILABLE", False)
+
+    # torchsim_nl should always work (with fallback)
+    mapping, sys_map, _shifts = neighbors.torchsim_nl(
+        positions, cell, pbc, cutoff, system_idx
     )
-    mapping_standard, shifts_standard = neighbors.standard_nl(
-        positions, cell, pbc, cutoff
+
+    # Should find neighbors
+    assert mapping.shape[0] == 2
+    assert mapping.shape[1] > 0
+    assert sys_map.shape[0] == mapping.shape[1]
+
+    # default_batched_nl should always be available
+    assert neighbors.default_batched_nl is not None
+    mapping2, _sys_map2, _shifts2 = neighbors.default_batched_nl(
+        positions, cell, pbc, cutoff, system_idx
     )
-
-    # torchsim_nl should always give consistent shape with standard_nl
-    assert mapping_torchsim.shape == mapping_standard.shape
-    assert shifts_torchsim.shape == shifts_standard.shape
-
-    # When vesin is unavailable, torchsim_nl should match standard_nl exactly
-    if not neighbors.VESIN_AVAILABLE:
-        torch.testing.assert_close(mapping_torchsim, mapping_standard)
-        torch.testing.assert_close(shifts_torchsim, shifts_standard)
+    assert mapping2.shape[1] > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available for testing")
 def test_torchsim_nl_gpu() -> None:
     """Test that torchsim_nl works on GPU (CUDA/ROCm)."""
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     device = torch.device("cuda")
     dtype = torch.float32
 
@@ -521,23 +364,30 @@ def test_torchsim_nl_gpu() -> None:
     cell = torch.eye(3, device=device, dtype=dtype) * 3.0
     pbc = torch.tensor([True, True, True], device=device)
     cutoff = torch.tensor(1.5, device=device, dtype=dtype)
+    system_idx = torch.zeros(2, dtype=torch.long, device=device)
 
-    # Should work on GPU regardless of vesin availability
-    mapping, shifts = neighbors.torchsim_nl(positions, cell, pbc, cutoff)
+    # Should work on GPU regardless of implementation availability
+    mapping, sys_map, shifts = neighbors.torchsim_nl(
+        positions, cell, pbc, cutoff, system_idx
+    )
 
     assert mapping.device.type == "cuda"
     assert shifts.device.type == "cuda"
+    assert sys_map.device.type == "cuda"
     assert mapping.shape[0] == 2  # (2, num_neighbors)
+
+    # Cleanup
+    torch.cuda.empty_cache()
 
 
 def test_torchsim_nl_fallback_when_vesin_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test that torchsim_nl falls back to standard_nl when vesin is unavailable.
+    """Test that torchsim_nl falls back to torch_nl when alchemiops/vesin unavailable.
 
-    This test simulates the case where vesin is not installed by monkeypatching
-    VESIN_AVAILABLE to False. This ensures the fallback logic is tested even in
-    CI environments where vesin is actually installed.
+    This test simulates the case where alchemiops and vesin are not available by
+    monkeypatching their availability flags to False. This ensures the fallback logic
+    is tested even in environments where they are actually installed.
     """
     device = torch.device("cpu")
     dtype = torch.float32
@@ -551,24 +401,42 @@ def test_torchsim_nl_fallback_when_vesin_unavailable(
     cell = torch.eye(3, device=device, dtype=dtype) * 3.0
     pbc = torch.tensor([False, False, False], device=device)
     cutoff = torch.tensor(1.5, device=device, dtype=dtype)
+    system_idx = torch.zeros(4, dtype=torch.long, device=device)
 
-    # Monkeypatch VESIN_AVAILABLE to False to simulate vesin not being installed
+    # Monkeypatch both availability flags to False
     monkeypatch.setattr(neighbors, "VESIN_AVAILABLE", False)
+    monkeypatch.setattr(neighbors, "ALCHEMIOPS_AVAILABLE", False)
 
-    # Call torchsim_nl with mocked unavailable vesin
-    mapping_torchsim, shifts_torchsim = neighbors.torchsim_nl(
-        positions, cell, pbc, cutoff
+    # Call torchsim_nl with mocked unavailable implementations
+    mapping_torchsim, sys_map_ts, shifts_torchsim = neighbors.torchsim_nl(
+        positions, cell, pbc, cutoff, system_idx
     )
 
-    # Call standard_nl directly for comparison
-    mapping_standard, shifts_standard = neighbors.standard_nl(
-        positions, cell, pbc, cutoff
+    # Call torch_nl_linked_cell directly for comparison
+    mapping_expected, sys_map_exp, shifts_expected = neighbors.torch_nl_linked_cell(
+        positions, cell, pbc, cutoff, system_idx
     )
 
-    # When VESIN_AVAILABLE is False, torchsim_nl should use standard_nl
+    # When both are unavailable, torchsim_nl should use torch_nl_linked_cell
     # and produce identical results
-    torch.testing.assert_close(mapping_torchsim, mapping_standard)
-    torch.testing.assert_close(shifts_torchsim, shifts_standard)
+    torch.testing.assert_close(mapping_torchsim, mapping_expected)
+    torch.testing.assert_close(shifts_torchsim, shifts_expected)
+    torch.testing.assert_close(sys_map_ts, sys_map_exp)
+
+
+def _no_neighbor_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Build a simple no-neighbor system."""
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [10.0, 10.0, 10.0]],
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    cell = torch.eye(3, device=DEVICE, dtype=DTYPE) * 20.0
+    pbc = torch.tensor([False, False, False], device=DEVICE)
+    cutoff = torch.tensor(1.0, device=DEVICE, dtype=DTYPE)
+    return positions, cell, pbc, cutoff
 
 
 def test_strict_nl_edge_cases() -> None:
@@ -618,13 +486,19 @@ def test_neighbor_lists_time_and_memory() -> None:
 
     # Test different implementations
     nl_implementations = [
-        neighbors.standard_nl,
         neighbors.torch_nl_n2,
         neighbors.torch_nl_linked_cell,
     ]
     if neighbors.VESIN_AVAILABLE:
         nl_implementations.extend(
-            [neighbors.vesin_nl_ts, cast("Callable[..., Any]", neighbors.vesin_nl)]
+            [
+                neighbors.vesin_nl_ts,
+                cast("Callable[..., Any]", neighbors.vesin_nl),
+            ]
+        )
+    if neighbors.ALCHEMIOPS_AVAILABLE and DEVICE.type == "cuda":
+        nl_implementations.extend(
+            [neighbors.alchemiops_nl_n2, neighbors.alchemiops_nl_cell_list]
         )
 
     for nl_fn in nl_implementations:
@@ -639,25 +513,18 @@ def test_neighbor_lists_time_and_memory() -> None:
         # Time the execution
         start_time = time.perf_counter()
 
-        if nl_fn in (neighbors.torch_nl_n2, neighbors.torch_nl_linked_cell):
-            system_idx = torch.zeros(n_atoms, dtype=torch.long, device=DEVICE)
-            # Fix pbc tensor shape
-            pbc = torch.tensor([[True, True, True]], device=DEVICE)
-            _mapping, _mapping_system, _shifts_idx = nl_fn(
-                positions=pos,
-                cell=cell,
-                pbc=pbc,
-                cutoff=cutoff,
-                system_idx=system_idx,
-                self_interaction=False,
-            )
-        else:
-            _mapping, _shifts = nl_fn(
-                positions=pos,
-                cell=cell,
-                pbc=torch.Tensor([True, True, True]),
-                cutoff=cutoff,
-            )
+        # All neighbor list functions now use the unified API with system_idx
+        system_idx = torch.zeros(n_atoms, dtype=torch.long, device=DEVICE)
+        # Fix pbc tensor shape
+        pbc = torch.tensor([[True, True, True]], device=DEVICE)
+        _mapping, _mapping_system, _shifts_idx = nl_fn(
+            positions=pos,
+            cell=cell,
+            pbc=pbc,
+            cutoff=cutoff,
+            system_idx=system_idx,
+            self_interaction=False,
+        )
 
         end_time = time.perf_counter()
         execution_time = end_time - start_time
@@ -680,10 +547,4 @@ def test_neighbor_lists_time_and_memory() -> None:
             assert cpu_memory_used < 5e8, (
                 f"{fn_name} used too much CPU memory: {cpu_memory_used / 1e6:.2f}MB"
             )
-            if nl_fn == neighbors.standard_nl:
-                # this function is just quite slow. So we have a higher tolerance.
-                # I tried removing "@jit.script" and it was still slow.
-                # (This nl function is just slow)
-                assert execution_time < 3, f"{fn_name} took too long: {execution_time}s"
-            else:
-                assert execution_time < 0.8, f"{fn_name} took too long: {execution_time}s"
+            assert execution_time < 0.8, f"{fn_name} took too long: {execution_time}s"

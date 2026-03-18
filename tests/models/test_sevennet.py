@@ -5,10 +5,10 @@ import torch
 
 from tests.conftest import DEVICE
 from tests.models.conftest import (
-    consistency_test_simstate_fixtures,
     make_model_calculator_consistency_test,
     make_validate_model_outputs_test,
 )
+from torch_sim.testing import SIMSTATE_BULK_GENERATORS
 
 
 try:
@@ -20,7 +20,8 @@ try:
 
 except ImportError:
     pytest.skip(
-        f"sevenn not installed: {traceback.format_exc()}", allow_module_level=True
+        f"sevenn not installed: {traceback.format_exc()}",  # ty:ignore[too-many-positional-arguments]
+        allow_module_level=True,
     )
 
 
@@ -34,8 +35,7 @@ def pretrained_sevenn_model():
     """Load a pretrained SevenNet model for testing."""
     cp = sevenn.util.load_checkpoint(model_name)
 
-    backend = "e3nn"
-    model_loaded = cp.build_model(backend)
+    model_loaded = cp.build_model()
     model_loaded.set_is_batch_data(True)
 
     return model_loaded.to(DEVICE)
@@ -61,13 +61,13 @@ def test_sevennet_initialization(pretrained_sevenn_model: AtomGraphSequential) -
     assert model.device == DEVICE
 
 
-# NOTE: we take [:-1] to skipbenzene due to eps volume giving numerically
+# NOTE: we do not test on the molecule sim states due to eps volume giving numerically
 # unstable stress off diagonal in xy. See: https://github.com/MDIL-SNU/SevenNet/issues/212
 test_sevennet_consistency = make_model_calculator_consistency_test(
     test_name="sevennet",
     model_fixture_name="sevenn_model",
     calculator_fixture_name="sevenn_calculator",
-    sim_state_names=consistency_test_simstate_fixtures[:-1],
+    sim_state_names=tuple(SIMSTATE_BULK_GENERATORS.keys()),
     dtype=DTYPE,
 )
 

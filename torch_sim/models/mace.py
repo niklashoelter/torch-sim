@@ -29,7 +29,6 @@ import torch
 import torch_sim as ts
 from torch_sim.models.interface import ModelInterface
 from torch_sim.neighbors import torchsim_nl
-from torch_sim.typing import StateDict
 
 
 try:
@@ -133,7 +132,7 @@ class MaceModel(ModelInterface):
                 indicating which system each atom belongs to. If not provided with
                 atomic_numbers, all atoms are assumed to be in the same system.
             neighbor_list_fn (Callable): Function to compute neighbor lists.
-                Defaults to vesin_nl_ts.
+                Defaults to torch_nl_linked_cell.
             compute_forces (bool): Whether to compute forces. Defaults to True.
             compute_stress (bool): Whether to compute stress. Defaults to True.
             enable_cueq (bool): Whether to enable CuEq acceleration. Defaults to False.
@@ -155,80 +154,73 @@ class MaceModel(ModelInterface):
 
         # Load model if provided as path
         if isinstance(model, str | Path):
-            self.model = torch.load(model, map_location=self._device)
+            self.model = torch.load(model, map_location=self.device, weights_only=False)
         elif isinstance(model, torch.nn.Module):
-            self.model = model.to(self._device)
+            self.model = model.to(self.device)
         else:
             raise TypeError("Model must be a path or torch.nn.Module")
 
         self.model = self.model.eval()
 
+        # Move all model components to device
+        self.model = self.model.to(device=self._device)
         if self.dtype is not None:
             self.model = self.model.to(dtype=self.dtype)
 
         if enable_cueq:
             print("Converting models to CuEq for acceleration")  # noqa: T201
-            self.model = run_e3nn_to_cueq(self.model)
+            self.model = run_e3nn_to_cueq(self.model, device=self.device.type)
 
         # Set model properties
         self.r_max = self.model.r_max
-        self.z_table = utils.AtomicNumberTable(
-            [int(z) for z in self.model.atomic_numbers]
-        )
-        self.model.atomic_numbers = (
-            self.model.atomic_numbers.detach().clone().to(device=self.device)
-        )
+        atomic_nums = self.model.atomic_numbers
+        if not isinstance(atomic_nums, torch.Tensor):
+            raise TypeError("MACE model atomic_numbers must be a tensor")
+        self.z_table = utils.AtomicNumberTable([int(z) for z in atomic_nums])
+        self.model.atomic_numbers = atomic_nums.detach().clone().to(device=self.device)
 
-        # Store flag to track if atomic numbers were provided at init
         self.atomic_numbers_in_init = atomic_numbers is not None
+        self.system_idx_in_init = system_idx is not None
 
-        # Set up system_idx information if atomic numbers are provided
         if atomic_numbers is not None:
-            if system_idx is None:
-                # If system_idx is not provided, assume all atoms belong to same system
-                system_idx = torch.zeros(
-                    len(atomic_numbers), dtype=torch.long, device=self.device
-                )
+            self.atomic_numbers = atomic_numbers
+            self._setup_node_attrs(atomic_numbers)
 
-            self.setup_from_system_idx(atomic_numbers, system_idx)
+        if system_idx is not None:
+            self.system_idx = system_idx
+            self._setup_ptr(system_idx)
 
-    def setup_from_system_idx(
-        self, atomic_numbers: torch.Tensor, system_idx: torch.Tensor
-    ) -> None:
-        """Set up internal state from atomic numbers and system indices.
+        if (
+            atomic_numbers is not None
+            and system_idx is not None
+            and system_idx.shape[0] != atomic_numbers.shape[0]
+        ):
+            raise ValueError(
+                f"system_idx length {system_idx.shape[0]} must match "
+                f"atomic_numbers length {atomic_numbers.shape[0]}."
+            )
 
-        Processes the atomic numbers and system indices to prepare the model for
-        forward pass calculations. Creates the necessary data structures for
-        batched processing of multiple systems.
+    def _setup_ptr(self, system_idx: torch.Tensor) -> None:
+        """Compute system boundary pointers from system indices.
+
+        Args:
+            system_idx (torch.Tensor): System indices tensor with shape [n_atoms].
+        """
+        counts = torch.bincount(system_idx)
+        self.n_systems = len(counts)
+        self.n_atoms_per_system = counts.tolist()
+        self.ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+
+    def _setup_node_attrs(self, atomic_numbers: torch.Tensor) -> None:
+        """Compute one-hot encoded node attributes from atomic numbers.
 
         Args:
             atomic_numbers (torch.Tensor): Atomic numbers tensor with shape [n_atoms].
-            system_idx (torch.Tensor): System indices tensor with shape [n_atoms]
-                indicating which system each atom belongs to.
         """
-        self.atomic_numbers = atomic_numbers
-        self.system_idx = system_idx
-
-        # Determine number of systems and atoms per system
-        self.n_systems = system_idx.max().item() + 1
-
-        # Create ptr tensor for system boundaries
-        self.n_atoms_per_system = []
-        ptr = [0]
-        for sys_idx in range(self.n_systems):
-            system_mask = system_idx == sys_idx
-            n_atoms = system_mask.sum().item()
-            self.n_atoms_per_system.append(n_atoms)
-            ptr.append(ptr[-1] + n_atoms)
-
-        self.ptr = torch.tensor(ptr, dtype=torch.long, device=self.device)
-        self.total_atoms = atomic_numbers.shape[0]
-
-        # Create one-hot encodings for all atoms
         self.node_attrs = to_one_hot(
             torch.tensor(
                 atomic_numbers_to_indices(
-                    atomic_numbers.cpu().numpy(), z_table=self.z_table
+                    atomic_numbers.detach().cpu().numpy(), z_table=self.z_table
                 ),
                 dtype=torch.long,
                 device=self.device,
@@ -238,7 +230,7 @@ class MaceModel(ModelInterface):
         )
 
     def forward(  # noqa: C901
-        self, state: ts.SimState | StateDict
+        self, state: ts.SimState, **_kwargs: object
     ) -> dict[str, torch.Tensor]:
         """Compute energies, forces, and stresses for the given atomic systems.
 
@@ -247,9 +239,9 @@ class MaceModel(ModelInterface):
         multiple systems and constructs the necessary neighbor lists.
 
         Args:
-            state (SimState | StateDict): State object containing positions, cell,
-                and other system information. Can be either a SimState object or a
-                dictionary with the relevant fields.
+            state (SimState): State object containing positions, cell, and other
+                system information.
+            **_kwargs: Unused; accepted for interface compatibility.
 
         Returns:
             dict[str, torch.Tensor]: Computed properties:
@@ -263,86 +255,68 @@ class MaceModel(ModelInterface):
                 or in the forward pass, or if provided in both places.
             ValueError: If system indices are not provided when needed.
         """
-        sim_state = (
-            state
-            if isinstance(state, ts.SimState)
-            else ts.SimState(**state, masses=torch.ones_like(state["positions"]))
+        if self.atomic_numbers_in_init:
+            if state.positions.shape[0] != self.atomic_numbers.shape[0]:
+                raise ValueError(
+                    f"Expected {self.atomic_numbers.shape[0]} atoms, "
+                    f"got {state.positions.shape[0]}."
+                )
+        elif not hasattr(self, "atomic_numbers") or not torch.equal(
+            state.atomic_numbers, self.atomic_numbers
+        ):
+            self._setup_node_attrs(state.atomic_numbers)
+            self.atomic_numbers = state.atomic_numbers
+
+        if self.system_idx_in_init:
+            if state.system_idx.shape[0] != self.system_idx.shape[0]:
+                raise ValueError(
+                    f"Expected system_idx of length {self.system_idx.shape[0]}, "
+                    f"got {state.system_idx.shape[0]}."
+                )
+        elif not hasattr(self, "system_idx") or not torch.equal(
+            state.system_idx, self.system_idx
+        ):
+            self._setup_ptr(state.system_idx)
+            self.system_idx = state.system_idx
+
+        # Wrap positions into the unit cell
+        wrapped_positions = (
+            ts.transforms.pbc_wrap_batched(
+                state.positions,
+                state.cell,
+                state.system_idx,
+                state.pbc,
+            )
+            if state.pbc.any()
+            else state.positions
         )
 
-        # Handle input validation for atomic numbers
-        if sim_state.atomic_numbers is None and not self.atomic_numbers_in_init:
-            raise ValueError(
-                "Atomic numbers must be provided in either the constructor or forward."
-            )
-        if sim_state.atomic_numbers is not None and self.atomic_numbers_in_init:
-            raise ValueError(
-                "Atomic numbers cannot be provided in both the constructor and forward."
-            )
-
-        # Use system_idx from init if not provided
-        if sim_state.system_idx is None:
-            if not hasattr(self, "system_idx"):
-                raise ValueError(
-                    "System indices must be provided if not set during initialization"
-                )
-            sim_state.system_idx = self.system_idx
-
-        # Update system_idx information if new atomic numbers are provided
-        if (
-            sim_state.atomic_numbers is not None
-            and not self.atomic_numbers_in_init
-            and not torch.equal(
-                sim_state.atomic_numbers,
-                getattr(self, "atomic_numbers", torch.zeros(0, device=self.device)),
-            )
-        ):
-            self.setup_from_system_idx(sim_state.atomic_numbers, sim_state.system_idx)
-
-        # Process each system's neighbor list separately
-        edge_indices = []
-        shifts_list = []
-        unit_shifts_list = []
-        offset = 0
-
-        # TODO (AG): Currently doesn't work for batched neighbor lists
-        for sys_idx in range(self.n_systems):
-            system_mask = sim_state.system_idx == sys_idx
-            # Calculate neighbor list for this system
-            edge_idx, shifts_idx = self.neighbor_list_fn(
-                positions=sim_state.positions[system_mask],
-                cell=sim_state.row_vector_cell[sys_idx],
-                pbc=sim_state.pbc,
-                cutoff=self.r_max,
-            )
-
-            # Adjust indices for the system
-            edge_idx = edge_idx + offset
-            shifts = torch.mm(shifts_idx, sim_state.row_vector_cell[sys_idx])
-
-            edge_indices.append(edge_idx)
-            unit_shifts_list.append(shifts_idx)
-            shifts_list.append(shifts)
-
-            offset += len(sim_state.positions[system_mask])
-
-        # Combine all neighbor lists
-        edge_index = torch.cat(edge_indices, dim=1)
-        unit_shifts = torch.cat(unit_shifts_list, dim=0)
-        shifts = torch.cat(shifts_list, dim=0)
+        # Batched neighbor list using linked-cell algorithm
+        edge_index, mapping_system, unit_shifts = self.neighbor_list_fn(
+            wrapped_positions,
+            state.row_vector_cell,
+            state.pbc,
+            self.r_max,
+            state.system_idx,
+        )
+        # Convert unit cell shift indices to Cartesian shifts
+        shifts = ts.transforms.compute_cell_shifts(
+            state.row_vector_cell, unit_shifts, mapping_system
+        )
 
         # Build data dict for MACE model
         data_dict = dict(
             ptr=self.ptr,
             node_attrs=self.node_attrs,
-            batch=sim_state.system_idx,
-            pbc=sim_state.pbc,
-            cell=sim_state.row_vector_cell,
-            positions=sim_state.positions,
+            batch=state.system_idx,
+            pbc=state.pbc,
+            cell=state.row_vector_cell,
+            positions=wrapped_positions,
             edge_index=edge_index,
             unit_shifts=unit_shifts,
             shifts=shifts,
-            total_charge=sim_state.charge,
-            total_spin=sim_state.spin,
+            total_charge=state.charge,
+            total_spin=state.spin,
         )
 
         # Get model output

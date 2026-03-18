@@ -1,5 +1,3 @@
-# codespell-ignore: convertor
-
 import traceback
 
 import ase.spacegroup
@@ -8,10 +6,10 @@ import pytest
 
 from tests.conftest import DEVICE
 from tests.models.conftest import (
-    consistency_test_simstate_fixtures,
     make_model_calculator_consistency_test,
     make_validate_model_outputs_test,
 )
+from torch_sim.testing import SIMSTATE_GENERATORS
 
 
 try:
@@ -19,9 +17,10 @@ try:
 
     from torch_sim.models.mattersim import MatterSimModel
 
-except ImportError:
+except (ImportError, OSError, RuntimeError, AttributeError, ValueError):
     pytest.skip(
-        f"mattersim not installed: {traceback.format_exc()}", allow_module_level=True
+        f"mattersim not installed: {traceback.format_exc()}",  # ty:ignore[too-many-positional-arguments]
+        allow_module_level=True,
     )
 
 
@@ -62,7 +61,7 @@ test_mattersim_consistency = make_model_calculator_consistency_test(
     test_name="mattersim",
     model_fixture_name="mattersim_model",
     calculator_fixture_name="mattersim_calculator",
-    sim_state_names=consistency_test_simstate_fixtures,
+    sim_state_names=tuple(SIMSTATE_GENERATORS.keys()),
 )
 
 test_mattersim_model_outputs = make_validate_model_outputs_test(
