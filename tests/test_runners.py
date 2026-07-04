@@ -553,6 +553,73 @@ def test_optimize_with_autobatcher_and_reporting(
         assert torch.any(traj_state.positions != init_state.positions)
 
 
+def test_optimize_recovers_from_step_oom(
+    ar_supercell_sim_state: SimState,
+    fe_supercell_sim_state: SimState,
+    lj_model: LennardJonesModel,
+) -> None:
+    """optimize should survive an OOM raised during an optimizer step.
+
+    The InFlightAutoBatcher packs batches near the memory limit, so a step can
+    still OOM. Instead of dying, optimize must free the cache, evict the largest
+    in-flight state back to the pending queue, retry with a smaller batch, and
+    still return every input state exactly once.
+    """
+    states = [
+        ar_supercell_sim_state,
+        fe_supercell_sim_state,
+        ar_supercell_sim_state,
+        fe_supercell_sim_state,
+    ]
+    n_states = len(states)
+    batched = ts.initialize_state(states, lj_model.device, lj_model.dtype)
+
+    init_fn, real_step_fn = ts.optimizers.OPTIM_REGISTRY[ts.Optimizer.fire]
+
+    # Inject a fake OOM into the first two optimizer steps that see a multi-system
+    # batch. Both wordings (PyTorch and Warp) must be recognised as OOM.
+    oom_messages = iter(
+        [
+            "CUDA out of memory. Tried to allocate 106.00 MiB",
+            "Failed to allocate 123456789 bytes",
+        ]
+    )
+
+    def flaky_step_fn(*args, **kwargs):
+        state = kwargs.get("state", args[0] if args else None)
+        if state is not None and state.n_systems > 1:
+            msg = next(oom_messages, None)
+            if msg is not None:
+                raise RuntimeError(msg)
+        return real_step_fn(*args, **kwargs)
+
+    autobatcher = InFlightAutoBatcher(
+        model=lj_model,
+        memory_scales_with="n_atoms",
+        # Large enough to hold all states in one batch, so eviction (not
+        # convergence-driven swapping) is what removes the OOM offender.
+        max_memory_scaler=100_000,
+    )
+
+    final_states = ts.optimize(
+        system=batched,
+        model=lj_model,
+        optimizer=(init_fn, flaky_step_fn),
+        convergence_fn=ts.generate_force_convergence_fn(force_tol=1e-1),
+        autobatcher=autobatcher,
+        init_kwargs={"cell_filter": ts.CellFilter.unit},
+    )
+
+    # Both injected OOMs were consumed (recovery path exercised).
+    assert next(oom_messages, "exhausted") == "exhausted"
+
+    # Every input state comes back exactly once, in order, none dropped.
+    assert isinstance(final_states, SimState)
+    assert final_states.n_systems == n_states
+    for init_state, final_state in zip(states, final_states.split(), strict=True):
+        assert torch.all(final_state.atomic_numbers == init_state.atomic_numbers)
+
+
 def test_integrate_with_default_autobatcher(
     ar_supercell_sim_state: SimState,
     fe_supercell_sim_state: SimState,

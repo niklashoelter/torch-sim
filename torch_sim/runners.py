@@ -17,7 +17,7 @@ import torch
 from tqdm import tqdm
 
 import torch_sim as ts
-from torch_sim.autobatching import BinningAutoBatcher, InFlightAutoBatcher
+from torch_sim.autobatching import BinningAutoBatcher, InFlightAutoBatcher, is_oom_error
 from torch_sim.integrators import INTEGRATOR_REGISTRY, Integrator
 from torch_sim.integrators.md import MDState
 from torch_sim.models.interface import ModelInterface
@@ -695,7 +695,39 @@ def optimize[T: OptimState](  # noqa: C901, PLR0915
         for _step in range(steps_between_swaps):
             if hasattr(state, "energy"):
                 last_energy = state.energy
-            state = step_fn(state=state, model=model, **optimizer_kwargs)
+            # Graceful per-step OOM recovery: the InFlightAutoBatcher packs
+            # batches close to the memory limit, so a step can still hit a
+            # non-deterministic OOM (PyTorch self-fragmentation, or an
+            # out-of-pool allocator such as Warp). Rather than let it kill the
+            # whole run, free the cache, evict the largest in-flight state back
+            # to the pending queue, and retry the step with a smaller batch.
+            # The evicted state is re-admitted later, so nothing is dropped.
+            while True:
+                try:
+                    state = step_fn(state=state, model=model, **optimizer_kwargs)
+                    break
+                except Exception as exc:
+                    can_evict = (
+                        isinstance(autobatcher, InFlightAutoBatcher)
+                        and state.n_systems > 1
+                    )
+                    if not (
+                        can_evict and is_oom_error(exc, autobatcher.oom_error_message)
+                    ):
+                        raise
+                    logger.warning(
+                        "optimize: OOM during optimizer step with %d system(s); "
+                        "evicting largest state and retrying. (%s)",
+                        state.n_systems,
+                        str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    state = autobatcher.evict_states(state)
+                    # last_energy was computed on the pre-eviction batch; realign
+                    # it with the shrunk batch so convergence stays correct.
+                    if hasattr(state, "energy"):
+                        last_energy = state.energy
 
             if trajectory_reporter:
                 trajectory_reporter.report(

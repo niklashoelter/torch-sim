@@ -43,6 +43,32 @@ logger = logging.getLogger(__name__)
 DEFAULT_OOM_ERROR_MESSAGES = ("CUDA out of memory", "Failed to allocate")
 
 
+def is_oom_error(
+    exc: BaseException,
+    oom_error_message: str | Sequence[str] = DEFAULT_OOM_ERROR_MESSAGES,
+) -> bool:
+    """Return whether an exception looks like a GPU out-of-memory error.
+
+    Matches by substring against the exception text so it recognises both the
+    PyTorch caching-allocator wording ("CUDA out of memory") and the Warp /
+    nvalchemiops wording ("Failed to allocate <n> bytes"). ``torch.cuda.
+    OutOfMemoryError`` is a subclass of ``RuntimeError`` and is matched via its
+    message.
+
+    Args:
+        exc (BaseException): Exception raised during a forward/optimization step.
+        oom_error_message (str | Sequence[str]): Substring or substrings that
+            identify an OOM error. Defaults to ``DEFAULT_OOM_ERROR_MESSAGES``.
+
+    Returns:
+        bool: True if the exception text contains any of the OOM substrings.
+    """
+    if isinstance(oom_error_message, str):
+        oom_error_message = [oom_error_message]
+    exc_str = str(exc)
+    return any(msg in exc_str for msg in oom_error_message)
+
+
 def to_constant_volume_bins(  # noqa: C901
     items: dict[int, float] | list[Any],
     max_volume: float,
@@ -909,6 +935,14 @@ class InFlightAutoBatcher[T: SimState]:
 
         self.completed_idx_og_order = []
 
+        # Buffers for states evicted mid-optimization to recover from a step-time
+        # OOM (see ``evict_states``). They are re-admitted ahead of the iterator
+        # by ``_get_next_states`` so no work is lost and every state still
+        # completes exactly once.
+        self._requeued_states: list[T] = []
+        self._requeued_idx: list[int] = []
+        self._requeued_scalers: list[float] = []
+
         self.first_batch_returned = False
         self._first_batch = self._get_first_batch()
         return self.max_memory_scaler
@@ -925,6 +959,23 @@ class InFlightAutoBatcher[T: SimState]:
         new_metrics: list[float] = []
         new_idx: list[int] = []
         new_states: list[T] = []
+
+        # Re-admit any states that were evicted to recover from a step-time OOM
+        # before pulling fresh states from the iterator. Their metric and
+        # original index are preserved, and their iteration_count entry already
+        # exists, so they must not be re-initialized here.
+        while self._requeued_states:
+            metric = self._requeued_scalers[0]
+            if (
+                self.current_scalers or new_metrics
+            ) and sum(self.current_scalers) + sum(new_metrics) + metric > (
+                self.max_memory_scaler
+            ):
+                break
+            new_metrics.append(self._requeued_scalers.pop(0))
+            new_idx.append(self._requeued_idx.pop(0))
+            new_states.append(self._requeued_states.pop(0))
+
         for state in self.states_iterator:
             metric = calculate_memory_scalers(
                 state, self.memory_scales_with, self.cutoff
@@ -971,6 +1022,55 @@ class InFlightAutoBatcher[T: SimState]:
             og_idx = self.current_idx.pop(idx)
             self.current_scalers.pop(idx)
             self.completed_idx_og_order.append(og_idx)
+
+    def evict_states(self, updated_state: T) -> T:
+        """Evict the largest in-flight state to recover from a step-time OOM.
+
+        Removes the system with the largest memory scaler from the current batch
+        and re-queues it so it is retried in a later (smaller) batch. This lets
+        the optimization loop recover from a non-deterministic out-of-memory
+        error raised during an optimizer step (from PyTorch self-fragmentation or
+        an out-of-pool allocator such as Warp) by shrinking the batch and
+        retrying, instead of letting the whole run die.
+
+        The evicted state is not lost: ``_get_next_states`` re-admits it ahead of
+        the iterator, its original index and metric are preserved, and its
+        iteration counter is untouched, so it still completes exactly once.
+
+        Args:
+            updated_state (SimState): The current in-flight batch. Modified
+                in-place to drop the evicted system.
+
+        Returns:
+            SimState: ``updated_state`` with the evicted system removed. If the
+                batch holds a single system it is returned unchanged (the caller
+                should re-raise, as the batch cannot be shrunk further).
+        """
+        if updated_state.n_systems <= 1:
+            return updated_state
+
+        # Evict the heaviest system: it frees the most memory, so the fewest
+        # evictions are needed to make the retried step fit.
+        pos = max(
+            range(len(self.current_scalers)), key=lambda i: self.current_scalers[i]
+        )
+        popped_state = updated_state.pop(pos)[0]
+        abs_idx = self.current_idx.pop(pos)
+        scaler = self.current_scalers.pop(pos)
+
+        self._requeued_states.append(popped_state)
+        self._requeued_idx.append(abs_idx)
+        self._requeued_scalers.append(scaler)
+
+        logger.warning(
+            "InFlightAutoBatcher: OOM recovery - evicted state (original idx %d, "
+            "scaler %.3g); %d system(s) remain in batch, %d re-queued for retry",
+            abs_idx,
+            scaler,
+            updated_state.n_systems,
+            len(self._requeued_states),
+        )
+        return updated_state
 
     def _get_first_batch(self) -> T:
         """Create and return the first batch of states.
