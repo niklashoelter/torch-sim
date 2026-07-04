@@ -69,6 +69,36 @@ def is_oom_error(
     return any(msg in exc_str for msg in oom_error_message)
 
 
+def _detach_state_tensors[T: SimState](
+    state: T, *, device: torch.device | None = None
+) -> T:
+    """Detach a state's tensors in-place, optionally moving them to a device.
+
+    Slicing/popping a system out of a batch preserves ``grad_fn``, and models
+    can return graph-carrying tensors (e.g. UMA's ``energy`` has
+    ``requires_grad=True``). A popped state that keeps such a tensor therefore
+    pins the entire batch forward graph. Accumulating those - completed states
+    held for the whole run, or evicted states parked for retry - grows GPU memory
+    until it fills the device. Detaching drops the graph; an optional device move
+    also releases the tensors' current-device footprint.
+
+    Args:
+        state (SimState): State whose tensor attributes are detached in-place.
+        device (torch.device | None): If given, detached tensors are also moved
+            to this device.
+
+    Returns:
+        SimState: The same state, with tensor attributes detached (and moved).
+    """
+    for attr_name, attr_value in state.attributes.items():
+        if torch.is_tensor(attr_value):
+            detached = attr_value.detach()
+            if device is not None:
+                detached = detached.to(device)
+            setattr(state, attr_name, detached)
+    return state
+
+
 def to_constant_volume_bins(  # noqa: C901
     items: dict[int, float] | list[Any],
     max_volume: float,
@@ -974,7 +1004,8 @@ class InFlightAutoBatcher[T: SimState]:
                 break
             new_metrics.append(self._requeued_scalers.pop(0))
             new_idx.append(self._requeued_idx.pop(0))
-            new_states.append(self._requeued_states.pop(0))
+            # Move the CPU-parked state back onto the model's device.
+            new_states.append(self._requeued_states.pop(0).to(self.model.device))
 
         for state in self.states_iterator:
             metric = calculate_memory_scalers(
@@ -1057,6 +1088,11 @@ class InFlightAutoBatcher[T: SimState]:
         popped_state = updated_state.pop(pos)[0]
         abs_idx = self.current_idx.pop(pos)
         scaler = self.current_scalers.pop(pos)
+
+        # Detach and offload the evicted state to CPU before queuing it, so it
+        # pins neither the batch forward autograd graph nor GPU memory while it
+        # waits. It is moved back to the device on re-admission.
+        popped_state = _detach_state_tensors(popped_state, device=torch.device("cpu"))
 
         self._requeued_states.append(popped_state)
         self._requeued_idx.append(abs_idx)
@@ -1209,6 +1245,14 @@ class InFlightAutoBatcher[T: SimState]:
         completed_idx = torch.where(convergence_tensor)[0].tolist()
 
         completed_states = updated_state.pop(completed_idx)
+
+        # Detach completed states before they are handed back and accumulated for
+        # the whole run. Models can return graph-carrying tensors (UMA's energy
+        # has requires_grad=True), and a popped state preserves that grad_fn, so
+        # without this every completed state would pin its swap's full forward
+        # graph - accumulating across hundreds of swaps until the GPU fills. The
+        # optimizer drives on detached forces, so nothing downstream needs grad.
+        completed_states = [_detach_state_tensors(state) for state in completed_states]
 
         # necessary to ensure states that finish at the same time are ordered properly
         completed_states.reverse()

@@ -694,7 +694,11 @@ def optimize[T: OptimState](  # noqa: C901, PLR0915
 
         for _step in range(steps_between_swaps):
             if hasattr(state, "energy"):
-                last_energy = state.energy
+                # Detach: energy can carry the forward autograd graph, and
+                # last_energy is held across the step (only used for the
+                # convergence check), so keeping the graph alive just wastes
+                # memory.
+                last_energy = state.energy.detach()
             # Graceful per-step OOM recovery: the InFlightAutoBatcher packs
             # batches close to the memory limit, so a step can still hit a
             # non-deterministic OOM (PyTorch self-fragmentation, or an
@@ -727,7 +731,7 @@ def optimize[T: OptimState](  # noqa: C901, PLR0915
                     # last_energy was computed on the pre-eviction batch; realign
                     # it with the shrunk batch so convergence stays correct.
                     if hasattr(state, "energy"):
-                        last_energy = state.energy
+                        last_energy = state.energy.detach()
 
             if trajectory_reporter:
                 trajectory_reporter.report(
