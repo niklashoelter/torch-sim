@@ -17,7 +17,12 @@ import torch
 from tqdm import tqdm
 
 import torch_sim as ts
-from torch_sim.autobatching import BinningAutoBatcher, InFlightAutoBatcher, is_oom_error
+from torch_sim.autobatching import (
+    BinningAutoBatcher,
+    InFlightAutoBatcher,
+    _detach_state_tensors,
+    is_oom_error,
+)
 from torch_sim.integrators import INTEGRATOR_REGISTRY, Integrator
 from torch_sim.integrators.md import MDState
 from torch_sim.models.interface import ModelInterface
@@ -472,10 +477,16 @@ def _chunked_apply[T: SimState](
     """
     autobatcher = BinningAutoBatcher(model=model, **batcher_kwargs)
     autobatcher.load_states(states)
-    initialized_states = []
 
+    # Detach each chunk's initialized state. The init forward (e.g. fire_init)
+    # produces graph-carrying tensors (UMA's energy has requires_grad=True), and
+    # these states are all accumulated before being concatenated - without
+    # detaching, every chunk's forward graph stays alive at once, pushing the
+    # init phase to the memory ceiling. Optimization recomputes forces/energy, so
+    # the init graph is never needed.
     initialized_states = [
-        fn(model=model, state=system, **init_kwargs) for system, _indices in autobatcher
+        _detach_state_tensors(fn(model=model, state=system, **init_kwargs))
+        for system, _indices in autobatcher
     ]
 
     ordered_states = autobatcher.restore_original_order(initialized_states)
