@@ -144,6 +144,39 @@ def to_constant_volume_bins(  # noqa: C901
     return [[payload for _, payload in bin_] for bin_ in bin_entries]
 
 
+def _detach_state_graph(state: SimState) -> SimState:
+    """Detach any autograd graph held by a state's tensors (in-place).
+
+    States that leave the active optimization batch (converged / completed) are
+    accumulated by callers such as :func:`torch_sim.optimize` until every system
+    in the run finishes. Some models return an ``energy`` (or ``stress``) tensor
+    that still references the full forward autograd graph, even though the
+    ``forces`` are already detached. Holding such a tensor pins all of that
+    forward pass's intermediate activations in GPU memory. Because one completed
+    state is retained per finished system, the pinned graphs accumulate and GPU
+    memory grows monotonically over a large run until a CUDA OOM is hit deep into
+    optimization - a leak that no memory-budget/batch-size tuning can avoid.
+
+    Detaching simply drops the graph references; the stored numeric values are
+    unchanged and completed states never need gradients again.
+
+    Args:
+        state (SimState): State to detach in-place.
+
+    Returns:
+        SimState: The same state instance, with grad-carrying tensors detached.
+    """
+    for attr_name in type(state)._get_all_attributes():  # noqa: SLF001
+        value = getattr(state, attr_name, None)
+        if isinstance(value, torch.Tensor) and value.requires_grad:
+            setattr(state, attr_name, value.detach())
+    for extras in (state._system_extras, state._atom_extras):  # noqa: SLF001
+        for key, value in extras.items():
+            if isinstance(value, torch.Tensor) and value.requires_grad:
+                extras[key] = value.detach()
+    return state
+
+
 def measure_model_memory_forward(state: SimState, model: ModelInterface) -> float:
     """Measure peak GPU memory usage during a model's forward pass.
 
@@ -1109,6 +1142,13 @@ class InFlightAutoBatcher[T: SimState]:
         completed_idx = torch.where(convergence_tensor)[0].tolist()
 
         completed_states = updated_state.pop(completed_idx)
+
+        # Completed states leave the active batch and are accumulated by the caller
+        # until the whole run finishes. Detach any lingering autograd graph (e.g. an
+        # ``energy`` tensor still tied to the forward pass) so the retained states do
+        # not pin forward-pass activations and leak GPU memory over a large run.
+        for completed_state in completed_states:
+            _detach_state_graph(completed_state)
 
         # necessary to ensure states that finish at the same time are ordered properly
         completed_states.reverse()
