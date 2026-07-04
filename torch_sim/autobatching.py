@@ -1127,6 +1127,24 @@ class InFlightAutoBatcher[T: SimState]:
         if not self.current_idx:
             return None, completed_states
 
+        # Avoid an unnecessary full-batch copy when nothing is swapped in.
+        # ``concatenate_states`` always torch.cat's every tensor, so even a
+        # single-element list produces a fresh duplicate of the whole batch.
+        # With ``steps_between_swaps=1`` the common case is that no new state
+        # was pulled from the iterator (the batch is already full) and no
+        # system converged, so the only remaining state is ``updated_state``
+        # itself. ``updated_state`` is always an internal working batch (the
+        # concatenated first batch or a keep-state produced by ``pop``), so it
+        # is safe to return directly. Re-concatenating it every step would
+        # create a ~2x transient memory spike and churn the CUDA caching
+        # allocator (a major source of fragmentation) over the hundreds of
+        # in-flight swaps in a long optimization. NB: we must NOT short-circuit
+        # states freshly pulled from ``_get_next_states`` - those are the
+        # caller's own objects and concatenation is what copies them, keeping
+        # the later in-place ``pop`` from corrupting the user's inputs.
+        if not next_states and updated_state.n_systems > 0:
+            return updated_state, completed_states
+
         # concatenate remaining state with next states
         if updated_state.n_systems > 0:
             next_states = [updated_state, *next_states]
