@@ -42,6 +42,29 @@ logger = logging.getLogger(__name__)
 # nvalchemiops kernels used by ORB v3) raise "Failed to allocate <n> bytes".
 DEFAULT_OOM_ERROR_MESSAGES = ("CUDA out of memory", "Failed to allocate")
 
+# Fraction of total device memory reserved as headroom on top of the measured
+# out-of-pool (Warp/D3) footprint. The memory probe (measure_model_memory_forward)
+# only runs a *forward* pass through the model and only sees PyTorch's caching
+# allocator (torch.cuda.max_memory_allocated). A real optimization run does much
+# more with the same budget:
+#   * forward + backward every step (forces are autograd gradients), which roughly
+#     doubles peak activation memory relative to the forward-only probe;
+#   * persistent optimizer state (FIRE velocities, (L)BFGS history buffers);
+#   * caching-allocator fragmentation that accumulates over thousands of in-flight
+#     batch swaps and shows up as the classic "N GiB reserved but unallocated" OOM.
+# Budgeting to ~100% of the single-forward OOM boundary therefore over-commits and
+# eventually crashes deep into optimization. This reserve keeps the steady-state
+# PyTorch footprint clear of the device ceiling. It is a fraction of *total* device
+# memory (not of the raw scaler) so it composes with the measured Warp headroom.
+STEADY_STATE_MEMORY_RESERVE = 0.10
+
+# Populated by measure_model_memory_forward with the per-forward-pass fraction of
+# total device memory consumed *outside* PyTorch's caching allocator (i.e. by the
+# Warp/nvalchemiops pool used for D3 dispersion / ORB neighbor lists). Read and
+# reset by estimate_max_memory_scaler to size explicit headroom for that pool,
+# whose allocations are invisible to torch.cuda.max_memory_allocated().
+_out_of_pool_fractions: list[float] = []
+
 
 def to_constant_volume_bins(  # noqa: C901
     items: dict[int, float] | list[Any],
@@ -187,7 +210,27 @@ def measure_model_memory_forward(state: SimState, model: ModelInterface) -> floa
     torch.cuda.ipc_collect()
     torch.cuda.reset_peak_memory_stats()
 
+    # Baseline device memory held *outside* PyTorch's caching allocator, i.e. the
+    # CUDA context, any other processes, and any already-resident Warp pool. Using
+    # a before/after delta isolates the memory this forward pass allocates in the
+    # Warp/nvalchemiops pool (D3 dispersion, ORB neighbor lists) from that fixed
+    # baseline, so the headroom estimate is not polluted by the CUDA context or
+    # unrelated processes sharing the device.
+    nonpool_before = 0
+    total_mem = 0
+    if torch.cuda.is_available():
+        free_before, total_mem = torch.cuda.mem_get_info()
+        nonpool_before = (total_mem - free_before) - torch.cuda.memory_reserved()
+
     model(state)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        free_after, total_mem = torch.cuda.mem_get_info()
+        nonpool_after = (total_mem - free_after) - torch.cuda.memory_reserved()
+        out_of_pool_delta = nonpool_after - nonpool_before
+        if total_mem > 0:
+            _out_of_pool_fractions.append(max(0.0, out_of_pool_delta / total_mem))
 
     return torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
 
@@ -445,6 +488,11 @@ def estimate_max_memory_scaler(
         f"and {max_state.n_systems} batches, and smallest system has "
         f"{min_state.n_atoms} atoms and {min_state.n_systems} batches.",
     )
+    # measure_model_memory_forward records, for each probe forward pass, the
+    # fraction of device memory that lands outside PyTorch's caching allocator.
+    # Reset before probing so we only see this call's measurements.
+    _out_of_pool_fractions.clear()
+
     min_state_max_batches = determine_max_batch_size(min_state, model, **kwargs)
     max_state_max_batches = determine_max_batch_size(max_state, model, **kwargs)
 
@@ -457,10 +505,37 @@ def estimate_max_memory_scaler(
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-    return min(
+    raw_scaler = min(
         min_state_max_batches * min_metric.item(),
         max_state_max_batches * max_metric.item(),
     )
+
+    # The raw scaler packs batches up to the *single-forward* OOM boundary of
+    # PyTorch's caching allocator. Two effects make that an over-commit for a real
+    # run, so we reserve explicit, partly-measured headroom below:
+    #
+    #  (1) Out-of-pool (Warp/D3) memory. The probe's max_memory_allocated() only
+    #      counts PyTorch's pool; the Warp/nvalchemiops pool (D3 dispersion, ORB
+    #      neighbor lists) allocates separately and is invisible to it. We measured
+    #      its peak per-forward footprint as a fraction of device memory and reserve
+    #      that fraction so PyTorch stops packing into space Warp will need.
+    #  (2) Steady-state overhead beyond a single forward: forward+backward every
+    #      step, optimizer state, and allocator fragmentation over thousands of
+    #      in-flight swaps (see STEADY_STATE_MEMORY_RESERVE).
+    warp_fraction = min(max(max(_out_of_pool_fractions, default=0.0), 0.0), 0.5)
+    headroom_factor = (1.0 - STEADY_STATE_MEMORY_RESERVE) * (1.0 - warp_fraction)
+    logger.debug(
+        "estimate_max_memory_scaler: raw=%.3g, measured out-of-pool fraction=%.3f, "
+        "steady-state reserve=%.2f -> headroom_factor=%.3f, scaler=%.3g",
+        raw_scaler,
+        warp_fraction,
+        STEADY_STATE_MEMORY_RESERVE,
+        headroom_factor,
+        raw_scaler * headroom_factor,
+    )
+    _out_of_pool_fractions.clear()
+
+    return raw_scaler * headroom_factor
 
 
 class BinningAutoBatcher[T: SimState]:
